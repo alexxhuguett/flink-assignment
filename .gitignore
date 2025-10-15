@@ -1,0 +1,51 @@
+# === OS / System files ===
+.DS_Store
+Thumbs.db
+
+# === IDEs ===
+# IntelliJ / JetBrains
+.idea/
+*.iml
+out/
+
+# VS Code
+.vscode/
+
+# === Build / Dependencies ===
+target/
+build/
+dist/
+node_modules/
+__pycache__/
+*.egg-info/
+
+# === Logs / Temp ===
+*.log
+logs/
+tmp/
+*.tmp
+
+# === Environment / Config ===
+.env
+*.local
+*.secret
+*.bak
+
+# === Data ===
+data/*.csv
+data/*.json
+!data/.gitkeep   # allow placeholders
+*.db
+*.sqlite
+
+# === Git LFS ===
+*.zip
+*.tar
+*.gz
+*.h5
+*.pickle
+*.pkl
+
+# === OS metadata ===
+ehthumbs.db
+Icon?
