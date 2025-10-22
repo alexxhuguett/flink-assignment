@@ -1,11 +1,20 @@
 import java.text.SimpleDateFormat
-
 import org.apache.flink.streaming.api.TimeCharacteristic
 import org.apache.flink.streaming.api.scala.{DataStream, StreamExecutionEnvironment}
 import org.apache.flink.api.scala._
+import org.apache.flink.cep.scala.CEP
+import org.apache.flink.cep.scala.pattern.Pattern
 import org.apache.flink.configuration.Configuration
+import org.apache.flink.streaming.api.functions.timestamps.AscendingTimestampExtractor
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows
+import org.apache.flink.streaming.api.windowing.time.Time
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow
+import org.apache.flink.table.shaded.org.joda.time.Instant
+import org.apache.flink.util.Collector
 import util.Protocol.{Commit, CommitGeo, CommitSummary}
 import util.{CommitGeoParser, CommitParser}
+
+import java.util.Date
 
 /** Do NOT rename this class, otherwise autograding will fail. **/
 object FlinkAssignment {
@@ -50,7 +59,11 @@ object FlinkAssignment {
     * Write a Flink application which outputs the sha of commits with at least 20 additions.
     * Output format: sha
     */
-  def question_one(input: DataStream[Commit]): DataStream[String] = ???
+  def question_one(input: DataStream[Commit]): DataStream[String] = {
+    input
+      .filter(_.stats.exists(_.additions >= 20))
+      .map(_.sha)
+  }
 
   /**
     * Write a Flink application which outputs the names of the files with more than 30 deletions.
@@ -62,7 +75,21 @@ object FlinkAssignment {
     * Count the occurrences of Java and Scala files. I.e. files ending with either .scala or .java.
     * Output format: (fileExtension, #occurrences)
     */
-  def question_three(input: DataStream[Commit]): DataStream[(String, Int)] = ???
+  def question_three(input: DataStream[Commit]): DataStream[(String, Int)] = {
+    input
+      .flatMap(_.files)
+      .flatMap(_.filename)
+      .flatMap { name =>
+        val ext = name.split("\\.").lastOption.getOrElse("")
+        ext match {
+          case "java"  => Some(("java", 1))
+          case "scala" => Some(("scala", 1))
+          case _       => None
+        }
+      }
+      .keyBy(_._1)
+      .sum(1)
+  }
 
   /**
     * Count the total amount of changes for each file status (e.g. modified, removed or added) for the following extensions: .js and .py.
@@ -76,7 +103,22 @@ object FlinkAssignment {
     * Make use of a non-keyed window.
     * Output format: (date, count)
     */
-  def question_five(input: DataStream[Commit]): DataStream[(String, Int)] = ???
+  def question_five(input: DataStream[Commit]): DataStream[(String, Int)] = {
+    input
+      // use the commit's committer date as event time (arrives in order per assignment)
+      .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit] {
+        override def extractAscendingTimestamp(c: Commit): Long =
+          c.commit.committer.date.getTime
+      })
+      // non-keyed daily tumbling window
+      .windowAll(TumblingEventTimeWindows.of(Time.days(1)))
+      // emit (dd-MM-yyyy, count)
+      .apply { (window: TimeWindow, elems: Iterable[Commit], out: Collector[(String, Int)]) =>
+        val fmt = new SimpleDateFormat("dd-MM-yyyy")
+        val date = fmt.format(new Date(window.getStart))
+        out.collect((date, elems.size))
+      }
+  }
 
   /**
     * Consider two types of commits; small commits and large commits whereas small: 0 <= x <= 20 and large: x > 20 where x = total amount of changes.
@@ -101,7 +143,62 @@ object FlinkAssignment {
     * Output format: CommitSummary
     */
   def question_seven(
-      commitStream: DataStream[Commit]): DataStream[CommitSummary] = ???
+      commitStream: DataStream[Commit]): DataStream[CommitSummary] = {
+
+    def repoFromUrl(url: String): String = {
+      val marker = "/repos/"
+      val i = url.indexOf(marker)
+      if (i >= 0) {
+        val rest = url.substring(i + marker.length)
+        val parts = rest.split("/", 3)
+        if (parts.length >= 2) s"${parts(0)}/${parts(1)}" else rest
+      } else url
+    }
+
+    def committerId(c: Commit): String =
+      c.committer.map(_.login).getOrElse(c.commit.committer.name)
+
+    commitStream
+      .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit] {
+        override def extractAscendingTimestamp(c: Commit): Long =
+          c.commit.committer.date.getTime
+      })
+      .keyBy(c => repoFromUrl(c.url))
+      .window(TumblingEventTimeWindows.of(Time.days(1)))
+      .apply { (repo: String, window: TimeWindow, elems: Iterable[Commit], out: Collector[CommitSummary]) =>
+        val fmt = new SimpleDateFormat("dd-MM-yyyy")
+        val date = fmt.format(new Date(window.getStart))
+
+        var commits = 0
+        var totalChanges = 0
+        val byCommitter = scala.collection.mutable.Map.empty[String, Int].withDefaultValue(0)
+
+        elems.foreach { c =>
+          commits += 1
+          totalChanges += c.stats.map(_.total).getOrElse(0)
+          val id = committerId(c)
+          byCommitter(id) = byCommitter(id) + 1
+        }
+
+        val uniqueCommitters = byCommitter.size
+        val maxByOne = if (byCommitter.isEmpty) 0 else byCommitter.values.max
+        val topCommitter =
+          byCommitter.collect { case (k, v) if v == maxByOne => k }.toSeq.sorted.mkString(",")
+
+        if (commits > 20 && uniqueCommitters <= 2) {
+          out.collect(
+            CommitSummary(
+              repo = repo,
+              date = date,
+              amountOfCommits = commits,
+              amountOfCommitters = uniqueCommitters,
+              totalChanges = totalChanges,
+              mostPopularCommitter = topCommitter
+            )
+          )
+        }
+      }
+  }
 
   /**
     * For this exercise there is another dataset containing CommitGeo events. A CommitGeo event stores the sha of a commit, a date and the continent it was produced in.
@@ -122,6 +219,50 @@ object FlinkAssignment {
     * Output format: (repository, filename)
     */
   def question_nine(
-      inputStream: DataStream[Commit]): DataStream[(String, String)] = ???
+      inputStream: DataStream[Commit]): DataStream[(String, String)] = {
+
+    case class FileEvent(repo: String, filename: String, status: String, ts: Long)
+
+    def repoFromUrl(url: String): String = {
+      val i = url.indexOf("/repos/")
+      val j = url.indexOf("/commits/", math.max(i, 0))
+      if (i >= 0 && j > i + 7) url.substring(i + 7, j) else "unknown/unknown"
+    }
+
+    val fileEvents: DataStream[FileEvent] =
+      inputStream
+        .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit]() {
+          override def extractAscendingTimestamp(c: Commit): Long =
+            c.commit.committer.date.getTime
+        })
+        .flatMap { c =>
+          val repo = repoFromUrl(c.url)
+          val ts   = c.commit.committer.date.getTime
+          c.files.flatMap { f =>
+            for {
+              name   <- f.filename
+              status <- f.status
+            } yield FileEvent(repo, name, status, ts)
+          }
+        }
+
+    // Key by (repo, filename)
+    val keyed = fileEvents.keyBy(fe => (fe.repo, fe.filename))
+
+    // Pattern: added -> removed within 1 day
+    val pattern = Pattern
+      .begin[FileEvent]("added").where(_.status == "added")
+      .next("removed").where(_.status == "removed")
+      .within(Time.days(1))
+
+    val patternStream = CEP.pattern(keyed, pattern)
+
+    patternStream.select { m =>
+      val a = m("added").head
+      val r = m("removed").head
+      // Emit once per match
+      (a.repo, a.filename)
+    }
+  }
 
 }
