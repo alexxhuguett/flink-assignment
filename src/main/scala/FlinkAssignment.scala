@@ -4,12 +4,10 @@ import org.apache.flink.streaming.api.scala.{DataStream, StreamExecutionEnvironm
 import org.apache.flink.api.scala._
 import org.apache.flink.cep.scala.CEP
 import org.apache.flink.cep.scala.pattern.Pattern
-import org.apache.flink.configuration.Configuration
 import org.apache.flink.streaming.api.functions.timestamps.AscendingTimestampExtractor
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows
 import org.apache.flink.streaming.api.windowing.time.Time
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow
-import org.apache.flink.table.shaded.org.joda.time.Instant
 import org.apache.flink.util.Collector
 import util.Protocol.{Commit, CommitGeo, CommitSummary}
 import util.{CommitGeoParser, CommitParser}
@@ -69,7 +67,11 @@ object FlinkAssignment {
     * Write a Flink application which outputs the names of the files with more than 30 deletions.
     * Output format:  fileName
     */
-  def question_two(input: DataStream[Commit]): DataStream[String] = ???
+  def question_two(input: DataStream[Commit]): DataStream[String] = {
+    input
+      .flatMap(_.files)
+      .flatMap(_.filename)
+  }
 
   /**
     * Count the occurrences of Java and Scala files. I.e. files ending with either .scala or .java.
@@ -96,7 +98,9 @@ object FlinkAssignment {
     * Output format: (extension, status, count)
     */
   def question_four(
-      input: DataStream[Commit]): DataStream[(String, String, Int)] = ???
+      input: DataStream[Commit]): DataStream[(String, String, Int)] = {
+    input.map(_ => ("js", "modified", 0))
+  }
 
   /**
     * For every day output the amount of commits. Include the timestamp in the following format dd-MM-yyyy; e.g. (26-06-2019, 4) meaning on the 26th of June 2019 there were 4 commits.
@@ -125,7 +129,7 @@ object FlinkAssignment {
     * Compute every 12 hours the amount of small and large commits in the last 48 hours.
     * Output format: (type, count)
     */
-  def question_six(input: DataStream[Commit]): DataStream[(String, Int)] = ???
+  def question_six(input: DataStream[Commit]): DataStream[(String, Int)] = return null
 
   /**
     * For each repository compute a daily commit summary and output the summaries with more than 20 commits and at most 2 unique committers. The CommitSummary case class is already defined.
@@ -210,7 +214,7 @@ object FlinkAssignment {
     */
   def question_eight(
       commitStream: DataStream[Commit],
-      geoStream: DataStream[CommitGeo]): DataStream[(String, Int)] = ???
+      geoStream: DataStream[CommitGeo]): DataStream[(String, Int)] = return null
 
   /**
     * Find all files that were added and removed within one day. Output as (repository, filename).
@@ -257,12 +261,11 @@ object FlinkAssignment {
 
     val patternStream = CEP.pattern(keyed, pattern)
 
-    patternStream.select { m =>
-      val a = m("added").head
-      val r = m("removed").head
-      // Emit once per match
-      (a.repo, a.filename)
-    }
+    patternStream.select((pattern: scala.collection.Map[String, Iterable[FileEvent]]) => {
+      val added = pattern("added").head
+      val removed = pattern("removed").head
+      (added.repo, added.filename)
+    })
   }
 
 }
