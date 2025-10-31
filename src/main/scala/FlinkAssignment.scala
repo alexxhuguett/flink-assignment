@@ -240,12 +240,12 @@ object FlinkAssignment {
     * Output format: (continent, amount)
     */
   def question_eight(
-      commitStream: DataStream[Commit],
-      geoStream: DataStream[CommitGeo]): DataStream[(String, Int)] = {
+                      commitStream: DataStream[Commit],
+                      geoStream: DataStream[CommitGeo]): DataStream[(String, Int)] = {
     val commit = commitStream
       .flatMap(commit => commit.files.map(file => (commit.sha, file)))
-      .filter{ case (s, f) => f.filename.exists(name => name.endsWith(".java"))} //sha, file
-      .map { case (sha, file) => (sha, file.changes) }
+      .filter(_._2.filename.exists(_.endsWith(".java"))) //sha, file
+      .map(x => (x._1, x._2.changes))
       .keyBy(_._1)
       .sum(1) // sha, changes per sha
 
