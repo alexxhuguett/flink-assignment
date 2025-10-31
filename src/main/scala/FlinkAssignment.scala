@@ -4,8 +4,9 @@ import org.apache.flink.streaming.api.scala.{DataStream, StreamExecutionEnvironm
 import org.apache.flink.api.scala._
 import org.apache.flink.cep.scala.CEP
 import org.apache.flink.cep.scala.pattern.Pattern
+import org.apache.flink.streaming.api.functions.co.ProcessJoinFunction
 import org.apache.flink.streaming.api.functions.timestamps.AscendingTimestampExtractor
-import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows
+import org.apache.flink.streaming.api.windowing.assigners.{SlidingEventTimeWindows, TumblingEventTimeWindows}
 import org.apache.flink.streaming.api.windowing.time.Time
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow
 import org.apache.flink.util.Collector
@@ -70,6 +71,7 @@ object FlinkAssignment {
   def question_two(input: DataStream[Commit]): DataStream[String] = {
     input
       .flatMap(_.files)
+      .filter(_.deletions > 30)
       .flatMap(_.filename)
   }
 
@@ -99,7 +101,16 @@ object FlinkAssignment {
     */
   def question_four(
       input: DataStream[Commit]): DataStream[(String, String, Int)] = {
-    input.map(_ => ("js", "modified", 0))
+    input
+      .flatMap(commit => commit.files)
+      .filter(file => file.filename.exists(name => name.endsWith(".js") || name.endsWith(".py")))
+      .map{file =>
+        val ext = if (file.filename.exists(_.endsWith(".js"))) ".js" else ".py"
+        val status = file.status.getOrElse("unknown")
+        (ext, status, file.changes)
+      }
+      .keyBy(file => (file._1, file._2))
+      .sum(2)
   }
 
   /**
@@ -129,7 +140,21 @@ object FlinkAssignment {
     * Compute every 12 hours the amount of small and large commits in the last 48 hours.
     * Output format: (type, count)
     */
-  def question_six(input: DataStream[Commit]): DataStream[(String, Int)] = return null
+  def question_six(input: DataStream[Commit]): DataStream[(String, Int)] = {
+    input
+      .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit] {
+        override def extractAscendingTimestamp(c: Commit): Long =
+          c.commit.committer.date.getTime
+      })
+      .map { commit =>
+        val total = commit.stats.map(_.total).getOrElse(0)
+        val commitType = if (total > 20) "large" else "small"
+        (commitType, 1)
+      }
+      .keyBy(_._1)
+      .window(SlidingEventTimeWindows.of(Time.hours(48), Time.hours(12)))
+      .sum(1)
+  }
 
   /**
     * For each repository compute a daily commit summary and output the summaries with more than 20 commits and at most 2 unique committers. The CommitSummary case class is already defined.
@@ -213,8 +238,49 @@ object FlinkAssignment {
     * Output format: (continent, amount)
     */
   def question_eight(
-      commitStream: DataStream[Commit],
-      geoStream: DataStream[CommitGeo]): DataStream[(String, Int)] = return null
+                      commitStream: DataStream[Commit],
+                      geoStream: DataStream[CommitGeo]
+                    ): DataStream[(String, Int)] = {
+
+    val commitsPerFile: DataStream[(String, util.Protocol.File)] =
+      commitStream
+        .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit] {
+          override def extractAscendingTimestamp(c: Commit): Long =
+            c.commit.committer.date.getTime
+        })
+        .flatMap { commit =>
+          commit.files.map(file => (commit.sha, file))
+        }(org.apache.flink.api.scala.createTypeInformation[(String, util.Protocol.File)])
+        .filter { t: (String, util.Protocol.File) =>
+          t._2.filename.exists(_.endsWith(".java"))
+        }
+
+    val geoWithTs: DataStream[CommitGeo] =
+      geoStream
+        .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[CommitGeo] {
+          override def extractAscendingTimestamp(g: CommitGeo): Long =
+            g.createdAt.getTime
+        })
+
+    commitsPerFile
+      .keyBy(_._1)                         // sha
+      .intervalJoin(geoWithTs.keyBy(_.sha))
+      .between(Time.hours(-1), Time.minutes(30))
+      .process(new ProcessJoinFunction[(String, util.Protocol.File), CommitGeo, (String, Int)] {
+        override def processElement(
+                                     left: (String, util.Protocol.File),
+                                     geo: CommitGeo,
+                                     ctx: ProcessJoinFunction[(String, util.Protocol.File), CommitGeo, (String, Int)]#Context,
+                                     out: Collector[(String, Int)]
+                                   ): Unit = {
+          out.collect((geo.continent, left._2.changes))
+        }
+      })
+      .keyBy(_._1) // continent
+      .window(TumblingEventTimeWindows.of(Time.days(7)))
+      .sum(1)
+  }
+
 
   /**
     * Find all files that were added and removed within one day. Output as (repository, filename).
