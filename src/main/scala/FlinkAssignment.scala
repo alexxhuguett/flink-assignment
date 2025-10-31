@@ -109,7 +109,7 @@ object FlinkAssignment {
         val status = file.status.getOrElse("unknown")
         (ext, status, file.changes)
       }
-      .keyBy(file => (file._1, file._2))
+      .keyBy(f => (f._1, f._2))
       .sum(2)
   }
 
@@ -142,17 +142,19 @@ object FlinkAssignment {
     */
   def question_six(input: DataStream[Commit]): DataStream[(String, Int)] = {
     input
-      .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit] {
-        override def extractAscendingTimestamp(c: Commit): Long =
-          c.commit.committer.date.getTime
-      })
-      .map { commit =>
-        val total = commit.stats.map(_.total).getOrElse(0)
+      .filter{commit =>
+        val commitDate = commit.commit.committer.date
+        val now = new Date()
+        val diffHours = (now.getTime - commitDate.getTime) / (1000 * 60 * 60)
+        diffHours <= 48
+      }
+      .map{commit =>
+        val total = commit.stats.map(stats => stats.total).getOrElse(0)
         val commitType = if (total > 20) "large" else "small"
         (commitType, 1)
       }
       .keyBy(_._1)
-      .window(SlidingEventTimeWindows.of(Time.hours(48), Time.hours(12)))
+      .timeWindow(Time.hours(12))
       .sum(1)
   }
 
@@ -239,48 +241,32 @@ object FlinkAssignment {
     */
   def question_eight(
                       commitStream: DataStream[Commit],
-                      geoStream: DataStream[CommitGeo]
-                    ): DataStream[(String, Int)] = {
+                      geoStream: DataStream[CommitGeo]): DataStream[(String, Int)] = {
+    val commit = commitStream
+      .flatMap(commit => commit.files.map(file => (commit.sha, file)))
+      .filter(_._2.filename.exists(_.endsWith(".java"))) //sha, file
+      .map(x => (x._1, x._2.changes))
+      .keyBy(_._1)
+      .sum(1) // sha, changes per sha
 
-    val commitsPerFile: DataStream[(String, util.Protocol.File)] =
-      commitStream
-        .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit] {
-          override def extractAscendingTimestamp(c: Commit): Long =
-            c.commit.committer.date.getTime
-        })
-        .flatMap { commit =>
-          commit.files.map(file => (commit.sha, file))
-        }(org.apache.flink.api.scala.createTypeInformation[(String, util.Protocol.File)])
-        .filter { t: (String, util.Protocol.File) =>
-          t._2.filename.exists(_.endsWith(".java"))
-        }
-
-    val geoWithTs: DataStream[CommitGeo] =
-      geoStream
-        .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[CommitGeo] {
-          override def extractAscendingTimestamp(g: CommitGeo): Long =
-            g.createdAt.getTime
-        })
-
-    commitsPerFile
-      .keyBy(_._1)                         // sha
-      .intervalJoin(geoWithTs.keyBy(_.sha))
+    geoStream
+      .keyBy(_.sha)
+      .intervalJoin(commit.keyBy(_._1)) // geostream, sha, changes
       .between(Time.hours(-1), Time.minutes(30))
-      .process(new ProcessJoinFunction[(String, util.Protocol.File), CommitGeo, (String, Int)] {
+      .process(new ProcessJoinFunction[CommitGeo, (String, Int), (String, Int)] {
         override def processElement(
-                                     left: (String, util.Protocol.File),
                                      geo: CommitGeo,
-                                     ctx: ProcessJoinFunction[(String, util.Protocol.File), CommitGeo, (String, Int)]#Context,
+                                     commit: (String, Int),
+                                     ctx: ProcessJoinFunction[CommitGeo, (String, Int), (String, Int)]#Context,
                                      out: Collector[(String, Int)]
                                    ): Unit = {
-          out.collect((geo.continent, left._2.changes))
+          out.collect((geo.continent, commit._2))
         }
       })
-      .keyBy(_._1) // continent
-      .window(TumblingEventTimeWindows.of(Time.days(7)))
+      .keyBy(_._1)
+      .timeWindow(Time.days(7))
       .sum(1)
   }
-
 
   /**
     * Find all files that were added and removed within one day. Output as (repository, filename).
