@@ -2,8 +2,6 @@ import java.text.SimpleDateFormat
 import org.apache.flink.streaming.api.TimeCharacteristic
 import org.apache.flink.streaming.api.scala.{DataStream, StreamExecutionEnvironment}
 import org.apache.flink.api.scala._
-import org.apache.flink.cep.scala.CEP
-import org.apache.flink.cep.scala.pattern.Pattern
 import org.apache.flink.streaming.api.functions.co.ProcessJoinFunction
 import org.apache.flink.streaming.api.functions.timestamps.AscendingTimestampExtractor
 import org.apache.flink.streaming.api.windowing.assigners.{SlidingEventTimeWindows, TumblingEventTimeWindows}
@@ -12,6 +10,9 @@ import org.apache.flink.streaming.api.windowing.windows.TimeWindow
 import org.apache.flink.util.Collector
 import util.Protocol.{Commit, CommitGeo, CommitSummary}
 import util.{CommitGeoParser, CommitParser}
+import org.apache.flink.cep.scala.CEP
+import org.apache.flink.cep.scala.pattern.Pattern
+import org.apache.flink.cep.PatternSelectFunction
 
 import java.util.Date
 
@@ -120,14 +121,11 @@ object FlinkAssignment {
     */
   def question_five(input: DataStream[Commit]): DataStream[(String, Int)] = {
     input
-      // use the commit's committer date as event time (arrives in order per assignment)
       .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit] {
         override def extractAscendingTimestamp(c: Commit): Long =
           c.commit.committer.date.getTime
       })
-      // non-keyed daily tumbling window
       .windowAll(TumblingEventTimeWindows.of(Time.days(1)))
-      // emit (dd-MM-yyyy, count)
       .apply { (window: TimeWindow, elems: Iterable[Commit], out: Collector[(String, Int)]) =>
         val fmt = new SimpleDateFormat("dd-MM-yyyy")
         val date = fmt.format(new Date(window.getStart))
@@ -142,19 +140,17 @@ object FlinkAssignment {
     */
   def question_six(input: DataStream[Commit]): DataStream[(String, Int)] = {
     input
-      .filter{commit =>
-        val commitDate = commit.commit.committer.date
-        val now = new Date()
-        val diffHours = (now.getTime - commitDate.getTime) / (1000 * 60 * 60)
-        diffHours <= 48
-      }
-      .map{commit =>
-        val total = commit.stats.map(stats => stats.total).getOrElse(0)
+      .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit] {
+        override def extractAscendingTimestamp(c: Commit): Long =
+          c.commit.committer.date.getTime
+      })
+      .map { commit =>
+        val total = commit.stats.map(_.total).getOrElse(0)
         val commitType = if (total > 20) "large" else "small"
         (commitType, 1)
       }
       .keyBy(_._1)
-      .timeWindow(Time.hours(12))
+      .window(SlidingEventTimeWindows.of(Time.hours(48), Time.hours(12)))
       .sum(1)
   }
 
@@ -175,60 +171,71 @@ object FlinkAssignment {
     */
   def question_seven(
       commitStream: DataStream[Commit]): DataStream[CommitSummary] = {
-
-    def repoFromUrl(url: String): String = {
-      val marker = "/repos/"
-      val i = url.indexOf(marker)
-      if (i >= 0) {
-        val rest = url.substring(i + marker.length)
-        val parts = rest.split("/", 3)
-        if (parts.length >= 2) s"${parts(0)}/${parts(1)}" else rest
-      } else url
+    def extractRepo(url: String): String = {
+      val cleaned = url.replaceAll("\\?.*$", "")
+      val parts = cleaned.split("/")
+      val idxRepos = parts.indexOf("repos")
+      if (idxRepos >= 0 && idxRepos + 2 < parts.length) {
+        s"${parts(idxRepos + 1)}/${parts(idxRepos + 2)}"
+      } else if (parts.length >= 4) {
+        s"${parts(parts.length - 3)}/${parts(parts.length - 2)}"
+      } else cleaned
     }
-
-    def committerId(c: Commit): String =
-      c.committer.map(_.login).getOrElse(c.commit.committer.name)
 
     commitStream
       .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit] {
         override def extractAscendingTimestamp(c: Commit): Long =
           c.commit.committer.date.getTime
       })
-      .keyBy(c => repoFromUrl(c.url))
+      .keyBy(c => extractRepo(c.url))
       .window(TumblingEventTimeWindows.of(Time.days(1)))
-      .apply { (repo: String, window: TimeWindow, elems: Iterable[Commit], out: Collector[CommitSummary]) =>
-        val fmt = new SimpleDateFormat("dd-MM-yyyy")
-        val date = fmt.format(new Date(window.getStart))
+      .process(new org.apache.flink.streaming.api.scala.function.ProcessWindowFunction[
+        Commit, CommitSummary, String, TimeWindow
+      ] {
+        override def process(
+                              repo: String,
+                              ctx: Context,
+                              elements: Iterable[Commit],
+                              out: Collector[CommitSummary]
+                            ): Unit = {
+          val fmt  = new SimpleDateFormat("dd-MM-yyyy")
+          val date = fmt.format(new Date(ctx.window.getStart))
 
-        var commits = 0
-        var totalChanges = 0
-        val byCommitter = scala.collection.mutable.Map.empty[String, Int].withDefaultValue(0)
+          var amountOfCommits     = 0
+          var totalChanges        = 0
+          val commitsPerCommitter = scala.collection.mutable.Map.empty[String, Int].withDefaultValue(0)
 
-        elems.foreach { c =>
-          commits += 1
-          totalChanges += c.stats.map(_.total).getOrElse(0)
-          val id = committerId(c)
-          byCommitter(id) = byCommitter(id) + 1
-        }
+          elements.foreach { c =>
+            amountOfCommits += 1
+            totalChanges += c.stats.map(_.total).getOrElse(0)
+            val committerName = c.commit.committer.name
+            commitsPerCommitter.update(committerName, commitsPerCommitter(committerName) + 1)
+          }
 
-        val uniqueCommitters = byCommitter.size
-        val maxByOne = if (byCommitter.isEmpty) 0 else byCommitter.values.max
-        val topCommitter =
-          byCommitter.collect { case (k, v) if v == maxByOne => k }.toSeq.sorted.mkString(",")
+          val amountOfCommitters = commitsPerCommitter.size
 
-        if (commits > 20 && uniqueCommitters <= 2) {
-          out.collect(
-            CommitSummary(
-              repo = repo,
-              date = date,
-              amountOfCommits = commits,
-              amountOfCommitters = uniqueCommitters,
-              totalChanges = totalChanges,
-              mostPopularCommitter = topCommitter
+          if (amountOfCommits > 20 && amountOfCommitters <= 2) {
+            val maxCommits = if (commitsPerCommitter.isEmpty) 0 else commitsPerCommitter.values.max
+            val topCommitter =
+              commitsPerCommitter
+                .collect { case (name, cnt) if cnt == maxCommits => name }
+                .toList
+                .sorted
+                .mkString(",")
+
+            out.collect(
+              CommitSummary(
+                repo              = repo,
+                date              = date,
+                amountOfCommits   = amountOfCommits,
+                amountOfCommitters= amountOfCommitters,
+                totalChanges      = totalChanges,
+                mostPopularCommitter = topCommitter
+              )
             )
-          )
+          }
         }
-      }
+      })
   }
 
   /**
@@ -241,30 +248,45 @@ object FlinkAssignment {
     */
   def question_eight(
                       commitStream: DataStream[Commit],
-                      geoStream: DataStream[CommitGeo]): DataStream[(String, Int)] = {
-    val commit = commitStream
-      .flatMap(commit => commit.files.map(file => (commit.sha, file)))
-      .filter(_._2.filename.exists(_.endsWith(".java"))) //sha, file
-      .map(x => (x._1, x._2.changes))
-      .keyBy(_._1)
-      .sum(1) // sha, changes per sha
+                      geoStream: DataStream[CommitGeo]
+                    ): DataStream[(String, Int)] = {
 
-    geoStream
-      .keyBy(_.sha)
-      .intervalJoin(commit.keyBy(_._1)) // geostream, sha, changes
+    val commitsPerFile: DataStream[(String, util.Protocol.File)] =
+      commitStream
+        .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit] {
+          override def extractAscendingTimestamp(c: Commit): Long =
+            c.commit.committer.date.getTime
+        })
+        .flatMap { commit =>
+          commit.files.map(file => (commit.sha, file))
+        }(org.apache.flink.api.scala.createTypeInformation[(String, util.Protocol.File)])
+        .filter { t: (String, util.Protocol.File) =>
+          t._2.filename.exists(_.endsWith(".java"))
+        }
+
+    val geoWithTs: DataStream[CommitGeo] =
+      geoStream
+        .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[CommitGeo] {
+          override def extractAscendingTimestamp(g: CommitGeo): Long =
+            g.createdAt.getTime
+        })
+
+    commitsPerFile
+      .keyBy(_._1)
+      .intervalJoin(geoWithTs.keyBy(_.sha))
       .between(Time.hours(-1), Time.minutes(30))
-      .process(new ProcessJoinFunction[CommitGeo, (String, Int), (String, Int)] {
+      .process(new ProcessJoinFunction[(String, util.Protocol.File), CommitGeo, (String, Int)] {
         override def processElement(
+                                     left: (String, util.Protocol.File),
                                      geo: CommitGeo,
-                                     commit: (String, Int),
-                                     ctx: ProcessJoinFunction[CommitGeo, (String, Int), (String, Int)]#Context,
+                                     ctx: ProcessJoinFunction[(String, util.Protocol.File), CommitGeo, (String, Int)]#Context,
                                      out: Collector[(String, Int)]
                                    ): Unit = {
-          out.collect((geo.continent, commit._2))
+          out.collect((geo.continent, left._2.changes))
         }
       })
       .keyBy(_._1)
-      .timeWindow(Time.days(7))
+      .window(TumblingEventTimeWindows.of(Time.days(7)))
       .sum(1)
   }
 
@@ -277,46 +299,51 @@ object FlinkAssignment {
   def question_nine(
       inputStream: DataStream[Commit]): DataStream[(String, String)] = {
 
-    case class FileEvent(repo: String, filename: String, status: String, ts: Long)
 
-    def repoFromUrl(url: String): String = {
-      val i = url.indexOf("/repos/")
-      val j = url.indexOf("/commits/", math.max(i, 0))
-      if (i >= 0 && j > i + 7) url.substring(i + 7, j) else "unknown/unknown"
-    }
 
-    val fileEvents: DataStream[FileEvent] =
+    val fileEvents: DataStream[(String, String, String, Long)] =
       inputStream
-        .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit]() {
+        .assignTimestampsAndWatermarks(new AscendingTimestampExtractor[Commit] {
           override def extractAscendingTimestamp(c: Commit): Long =
             c.commit.committer.date.getTime
         })
-        .flatMap { c =>
-          val repo = repoFromUrl(c.url)
-          val ts   = c.commit.committer.date.getTime
-          c.files.flatMap { f =>
+        .flatMap { commit =>
+          val cleaned = commit.url.replaceAll("\\?.*$", "")
+          val parts   = cleaned.split("/")
+          val idxRepos = parts.indexOf("repos")
+          val repo =
+            if (idxRepos >= 0 && idxRepos + 2 < parts.length)
+              s"${parts(idxRepos + 1)}/${parts(idxRepos + 2)}"
+            else if (parts.length >= 4)
+              s"${parts(parts.length - 3)}/${parts(parts.length - 2)}"
+            else cleaned
+
+          val ts = commit.commit.committer.date.getTime
+
+          commit.files.flatMap { f =>
             for {
               name   <- f.filename
               status <- f.status
-            } yield FileEvent(repo, name, status, ts)
+              if (status == "added" || status == "removed")
+            } yield (repo, name, status, ts)
           }
-        }
+        }(org.apache.flink.api.scala.createTypeInformation[(String, String, String, Long)])
 
-    // Key by (repo, filename)
-    val keyed = fileEvents.keyBy(fe => (fe.repo, fe.filename))
+    val pattern: Pattern[(String, String, String, Long), (String, String, String, Long)] =
+      Pattern
+        .begin[(String, String, String, Long)]("added").where(_._3 == "added")
+        .followedBy("removed").where(_._3 == "removed")
+        .within(Time.days(1))
 
-    // Pattern: added -> removed within 1 day
-    val pattern = Pattern
-      .begin[FileEvent]("added").where(_.status == "added")
-      .next("removed").where(_.status == "removed")
-      .within(Time.days(1))
+    val keyed = fileEvents.keyBy(e => (e._1, e._2)) 
 
     val patternStream = CEP.pattern(keyed, pattern)
 
-    patternStream.select((pattern: scala.collection.Map[String, Iterable[FileEvent]]) => {
-      val added = pattern("added").head
-      val removed = pattern("removed").head
-      (added.repo, added.filename)
+    patternStream.select(new PatternSelectFunction[(String, String, String, Long), (String, String)] {
+      override def select(m: java.util.Map[String, java.util.List[(String, String, String, Long)]]): (String, String) = {
+        val added = m.get("added").get(0)
+        (added._1, added._2)
+      }
     })
   }
 
